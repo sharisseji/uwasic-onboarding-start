@@ -15,7 +15,7 @@
 
 // Timing assumptions implied by 2-stage synchronizers: nCS must stay high
 // for at least 3 clk cycles between transactions, and must not deassert within
-// ~2 clk cycles of the 16th SCLK rising edge (nCS posedge takes priority over a
+// ~2 clk cycles of the 16th SCLK rising edge (a high nCS takes priority over a
 // SCLK posedge detected in the same clk cycle).
 
 module spi_peripheral (
@@ -31,7 +31,7 @@ module spi_peripheral (
     output reg [7:0]  pwm_duty_cycle
 );
 
-    localparam [4:0] FRAME_BITS = 5'd16;  // 1 r/w + 7 addr + 8 data
+    localparam [3:0] LAST_BIT = 4'd15;  // 16th bit: 1 r/w + 7 addr + 8 data
 
     // implemented registers, all other addresses are ignored
     localparam [6:0] ADDR_EN_OUT_7_0  = 7'h00;  // enable output on uo_out[7:0]
@@ -47,13 +47,12 @@ module spi_peripheral (
     reg copi_sync;                 // synchronized COPI
     reg ncs_meta;                  // first nCS synchronizer stage
     reg ncs_sync;                  // synchronized nCS
-    reg ncs_sync_d;                // prev nCS sample
-    reg [4:0] bit_count;           // # of sampled bits
+    reg [3:0] bit_count;           // # of sampled bits, wraps after the 16th
     reg [15:0] rx_shift_reg;       // received bits, holds the frame once full
     reg transaction_valid;         // set when 16 bits arrive, safe to commit
+    reg frame_overrun;             // sticky: more than 16 bits seen this frame
 
     wire sclk_posedge = sclk_sync && !sclk_sync_d;      // mode-0 sample edge
-    wire ncs_posedge = ncs_sync && !ncs_sync_d;         // end of transaction
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -64,10 +63,10 @@ module spi_peripheral (
             copi_sync         <= 1'b0;
             ncs_meta          <= 1'b1;
             ncs_sync          <= 1'b1;
-            ncs_sync_d        <= 1'b1;
-            bit_count         <= 5'd0;
+            bit_count         <= 4'd0;
             rx_shift_reg      <= 16'd0;
             transaction_valid <= 1'b0;
+            frame_overrun     <= 1'b0;
             en_reg_out_7_0    <= 8'd0;
             en_reg_out_15_8   <= 8'd0;
             en_reg_pwm_7_0    <= 8'd0;
@@ -82,11 +81,10 @@ module spi_peripheral (
             copi_sync   <= copi_meta;
             ncs_meta    <= ncs;
             ncs_sync    <= ncs_meta;
-            ncs_sync_d  <= ncs_sync;
 
             // commit when chip select is deasserted only
-            if (ncs_posedge) begin
-                bit_count <= 5'd0;
+            if (ncs_sync) begin
+                bit_count <= 4'd0;
                 if (transaction_valid) begin
                     // writes only, reads are not supported
                     if (rx_shift_reg[15]) begin
@@ -102,24 +100,24 @@ module spi_peripheral (
                         endcase
                     end
                 end
+                // self-clearing, so a held-high nCS commits exactly once
                 transaction_valid <= 1'b0;
-            end else if (ncs_sync) begin
-                bit_count <= 5'd0;
+                frame_overrun     <= 1'b0;
             end else if (sclk_posedge) begin
                 // shift in 1 COPI bit on each synchronized SCLK rising edge.
-                // stops at FRAME_BITS so the frame survives until nCS rises.
-                if (bit_count < FRAME_BITS) begin
+                // transaction_valid doubles as the "frame full" flag, so
+                // shifting stops and the frame survives until nCS rises.
+                if (!transaction_valid && !frame_overrun) begin
                     rx_shift_reg <= {rx_shift_reg[14:0], copi_sync};
-                end
-
-                if (bit_count == (FRAME_BITS - 5'd1)) begin
-                    bit_count         <= FRAME_BITS;
-                    transaction_valid <= 1'b1;
-                end else if (bit_count == FRAME_BITS) begin
-                    // > 16 makes the transaction invalid
-                    transaction_valid <= 1'b0;
+                    bit_count    <= bit_count + 1'b1;
+                    if (bit_count == LAST_BIT) begin
+                        transaction_valid <= 1'b1;
+                    end
                 end else begin
-                    bit_count <= bit_count + 1'b1;
+                    // a 17th SCLK edge invalidates the frame, and the overrun
+                    // flag is sticky so no later edge can re-validate it
+                    transaction_valid <= 1'b0;
+                    frame_overrun     <= 1'b1;
                 end
             end
         end
